@@ -143,6 +143,14 @@ unsigned long LastFlowMeasureTime     = 0;      // Last time flow was measured
 unsigned long LastFlowPulseCount      = 0;       // Pulse count at last measurement
 const float FLOW_SENSOR_CALIBRATION   = 0.6;  // YF201 pulses per mL (adjust based on calibration)
 
+// DISPENSE / SHOWERHEAD LIMITS
+const float SHOWERHEAD_CAPACITY_ML = 45.0;
+const unsigned long SHOWERHEAD_DRAIN_TIME_MS = 10000;
+const unsigned long BLOOM_SOAK_TIME_MS = 45000;
+const unsigned long PAUSE_BETWEEN_POURS_MS = 30000;
+const unsigned long FILL_FLOW_TIMEOUT_MS = 60000;
+const unsigned long FLOW_START_TIMEOUT_MS = 5000;
+
 // APP COMMUNICATION
 struct RecipeData {
     unsigned int TargetBeanWeight  =  25;  // grams
@@ -227,6 +235,27 @@ enum MachineStates{ // !!!!WRITE COMMENTS!!!!
 };
 
 MachineStates CurrentState = DISPENSE; // Initialize in IDLE
+
+// The dispenser fills the showerhead in 45 mL-or-smaller batches, then lets it drain.
+enum DispensePhase {
+    DISPENSE_BLOOM,
+    DISPENSE_FILL_SHOWERHEAD,
+    DISPENSE_DRAIN_SHOWERHEAD,
+    DISPENSE_BLOOM_SOAK,
+    DISPENSE_PAUSE_BETWEEN_POURS,
+    DISPENSE_COMPLETE
+};
+
+DispensePhase CurrentDispensePhase = DISPENSE_BLOOM;
+unsigned int CurrentPour = 0;  // 0 = bloom, 1-4 = regular pours
+float TotalDispenseTargetML = 0.0;
+float BloomTargetML = 0.0;
+float PourTargetML = 0.0;
+float CurrentPourTargetML = 0.0;
+float CurrentPourDispensedML = 0.0;
+float CurrentFillTargetML = 0.0;
+unsigned long FillStartPulseCount = 0;
+unsigned long DispensePhaseStartTime = 0;
 
 /*void HandleIDLE(){
     if (StateFlags.GENERAL_Initialized == false){
@@ -665,174 +694,203 @@ void HandleHEAT(){
         return;
     }
 }
+void StartShowerheadFill(float requestedVolumeML) {
+    CurrentFillTargetML = requestedVolumeML > SHOWERHEAD_CAPACITY_ML
+                              ? SHOWERHEAD_CAPACITY_ML
+                              : requestedVolumeML;
+    FillStartPulseCount = FlowPulseCount;
+    DispensePhaseStartTime = millis();
+    CurrentDispensePhase = DISPENSE_FILL_SHOWERHEAD;
+
+    // Keep the valve open while pumping. It stays open during the subsequent drain.
+    digitalWrite(SOLENOID_PIN, HIGH);
+    digitalWrite(PUMP_2_PIN, HIGH);
+}
+void StopDispenseWithError(const char *message) {
+    digitalWrite(PUMP_2_PIN, LOW);
+    digitalWrite(SOLENOID_PIN, LOW);
+    detachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN_2));
+
+    StateFlags.DISPENSE_TimeoutOccurred = true;
+    StateFlags.GENERAL_Initialized = false;
+    CurrentState = ERROR;
+    StateStartTime = millis();
+    Serial.println(message);
+}
+
 void HandleDISPENSE(){
-
-    unsigned long elapsedTime = millis() - StateStartTime;
-    float bloomVolume = weightGround * 2;
-    float remainingVolume = CurrentWeightWater - bloomVolume;
-    float volumePerCycle = remainingVolume / 4;
-
-    if (StateFlags.GENERAL_Initialized == false){ // First run this state
+    if (StateFlags.GENERAL_Initialized == false) { // First run in this state
         pinMode(SOLENOID_PIN, OUTPUT);
         pinMode(PUMP_2_PIN, OUTPUT);
         pinMode(FLOW_SENSOR_PIN_2, INPUT_PULLUP);
-        
-        // Setup flow sensor interrupt for dispense
-        attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN_2), FlowSensorISR, RISING);
-        
-        // Reset flow tracking variables
+
         FlowPulseCount = 0;
         LastFlowPulseCount = 0;
         LastFlowMeasureTime = millis();
-        
-        digitalWrite(SOLENOID_PIN, HIGH); // Turn solenoid ON (open valve)
-        delay(500);
-        digitalWrite(PUMP_2_PIN, HIGH);   // Turn PUMP_2 ON
-        
-        StateStartTime = millis();
-        StateDuration = 270000;  // 4:30 minutes total (270 seconds)
-        
-        Serial.println("[DISPENSE] Starting bloom phase...");
-        Serial.print("[DISPENSE] Bean weight: ");
-        Serial.print(weightGround);
-        Serial.println(" g");
-        Serial.print("[DISPENSE] Bloom volume: ");
-        Serial.print(bloomVolume);
-        Serial.println(" mL");
-        Serial.print("[DISPENSE] Water available: ");
-        Serial.print(CurrentWeightWater);
-        Serial.println(" mL");
-        Serial.print("[DISPENSE] Remaining volume per cycle: ");
-        Serial.print(volumePerCycle);
-        Serial.println(" mL");
-        
-        StateFlags.GENERAL_Initialized = true;
-        return;
-    }
-    
-   
-    
-    // Time allocation: 45s bloom + 4 cycles with pauses
-    const unsigned long bloomDuration = 45000;      // 45 seconds
-    const unsigned long timePerCycle = 56250;       // ~56 seconds per cycle
-    const unsigned long pauseBetweenCycles = 30000; // 30 second pause
-    
-    // Calculate total water dispensed so far
-    float totalWaterDispensed = (float)FlowPulseCount / FLOW_SENSOR_CALIBRATION;
-    
-    // PHASE 1: BLOOM (0-45 seconds)
-    if (elapsedTime < bloomDuration) {
-        // Monitor bloom phase
-        CurrentFlowRate = CalculateFlowRate();
-        
-        Serial.print("[DISPENSE] BLOOM Phase - Elapsed: ");
-        Serial.print(elapsedTime / 1000);
-        Serial.print("s | Flow: ");
-        Serial.print(CurrentFlowRate);
-        Serial.print(" mL/s | Dispensed: ");
-        Serial.print(totalWaterDispensed);
-        Serial.print(" / ");
-        Serial.print(bloomVolume);
-        Serial.println(" mL");
-        
-        // Safety check: if bloom phase overflows
-        if (totalWaterDispensed > bloomVolume * 1.1) {
-            Serial.println("[DISPENSE] WARNING: Bloom phase exceeded target volume!");
-        }
-        return;
-    }
-    
-    // PHASES 2-5: FOUR DISPENSE CYCLES (after bloom)
-    unsigned long timeIntoCycles = elapsedTime - bloomDuration;
-    unsigned long totalCycleDuration = timePerCycle + pauseBetweenCycles;
-    
-    // Determine which cycle we're in (0-3, or 4 if all complete)
-    unsigned int currentCycle = (timeIntoCycles / totalCycleDuration) + 1;
-    unsigned long timeIntoCurrentCycle = timeIntoCycles % totalCycleDuration;
-    
-    // All cycles complete
-    if (currentCycle > 4) {
-        digitalWrite(PUMP_2_PIN, LOW);
-        digitalWrite(SOLENOID_PIN, LOW);
-        detachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN_2));
-        
-        Serial.println("[DISPENSE] ========== DISPENSE COMPLETE ==========");
-        Serial.print("[DISPENSE] Total water dispensed: ");
-        Serial.print(totalWaterDispensed);
-        Serial.println(" mL");
-        Serial.print("[DISPENSE] Total time: ");
-        Serial.print(elapsedTime / 1000);
-        Serial.println(" seconds");
-        
-        StateFlags.DISPENSE_DispensingComplete = true;
-        CurrentState = IDLE;
-        StateStartTime = millis();
-        memset(&StateFlags, 0, sizeof(StateFlags));
-        FlowPulseCount = 0;  // Reset pulse count
-        return;
-    }
-    
-    // During active dispense cycle (not pause)
-    if (timeIntoCurrentCycle < timePerCycle) {
-        CurrentFlowRate = CalculateFlowRate();
-        
-        // Calculate water dispensed in this cycle
-        // Total dispensed minus bloom and previous cycles
-        float waterInPreviousCycles = (currentCycle - 1) * volumePerCycle;
-        float waterInThisCycle = totalWaterDispensed - bloomVolume - waterInPreviousCycles;
-        
-        Serial.print("[DISPENSE] CYCLE ");
-        Serial.print(currentCycle);
-        Serial.print(" - Elapsed in cycle: ");
-        Serial.print(timeIntoCurrentCycle / 1000);
-        Serial.print("s | Flow: ");
-        Serial.print(CurrentFlowRate);
-        Serial.print(" mL/s | Cycle progress: ");
-        Serial.print(waterInThisCycle);
-        Serial.print(" / ");
-        Serial.print(volumePerCycle);
-        Serial.println(" mL");
-        
-        // Safety check: detect if flow stopped during active phase
-        if (CurrentFlowRate < 0.05 && timeIntoCurrentCycle > 5000) {
-            Serial.println("[DISPENSE] ERROR: Flow stopped during active cycle!");
-            digitalWrite(PUMP_2_PIN, LOW);
-            digitalWrite(SOLENOID_PIN, LOW);
-            detachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN_2));
-            
-            StateFlags.DISPENSE_TimeoutOccurred = true;
-            CurrentState = ERROR;
-            StateStartTime = millis();
-            memset(&StateFlags, 0, sizeof(StateFlags));
-            FlowPulseCount = 0;
+        attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN_2), FlowSensorISR, RISING);
+
+        // Prefer the requested recipe volume. The measured boiler volume is a fallback
+        // for the current standalone test configuration.
+        TotalDispenseTargetML = CurrentRecipe.TargetWaterWeight > 0
+                                    ? CurrentRecipe.TargetWaterWeight
+                                    : CurrentWeightWater;
+        if (TotalDispenseTargetML <= 0.0) {
+            StopDispenseWithError("[DISPENSE] ERROR: No target water volume available");
             return;
         }
-    } 
-    else {
-        // Pause between cycles
-        unsigned long timeIntoPause = timeIntoCurrentCycle - timePerCycle;
-        
-        Serial.print("[DISPENSE] PAUSE after cycle ");
-        Serial.print(currentCycle);
-        Serial.print(" - Elapsed: ");
-        Serial.print(timeIntoPause / 1000);
-        Serial.print("s / 30s");
-        Serial.println();
+
+        BloomTargetML = weightGround * 2.0;
+        if (BloomTargetML > TotalDispenseTargetML) {
+            BloomTargetML = TotalDispenseTargetML;
+        }
+        PourTargetML = (TotalDispenseTargetML - BloomTargetML) / 4.0;
+        CurrentPour = 0;
+        CurrentPourTargetML = BloomTargetML;
+        CurrentPourDispensedML = 0.0;
+
+        // Timeout includes a full allowed fill time and drain time for every 45 mL fill,
+        // the bloom soak, and the three rests between the four regular pours.
+        unsigned int fillCount = (unsigned int)((TotalDispenseTargetML + SHOWERHEAD_CAPACITY_ML - 0.001) /
+                                                 SHOWERHEAD_CAPACITY_ML);
+        StateDuration = (unsigned long)fillCount *
+                            (FILL_FLOW_TIMEOUT_MS + SHOWERHEAD_DRAIN_TIME_MS) +
+                        BLOOM_SOAK_TIME_MS + (3 * PAUSE_BETWEEN_POURS_MS);
+        StateStartTime = millis();
+
+        StateFlags.DISPENSE_DispensingComplete = false;
+        StateFlags.DISPENSE_TimeoutOccurred = false;
+        StateFlags.GENERAL_Initialized = true;
+
+        Serial.println("[DISPENSE] Starting volume-controlled bloom...");
+        Serial.print("[DISPENSE] Total target: ");
+        Serial.print(TotalDispenseTargetML);
+        Serial.println(" mL");
+        Serial.print("[DISPENSE] Bloom target: ");
+        Serial.print(BloomTargetML);
+        Serial.println(" mL");
+        Serial.print("[DISPENSE] Each regular pour: ");
+        Serial.print(PourTargetML);
+        Serial.println(" mL");
+
+        if (CurrentPourTargetML > 0.0) {
+            StartShowerheadFill(CurrentPourTargetML);
+        } else {
+            CurrentDispensePhase = DISPENSE_BLOOM_SOAK;
+            DispensePhaseStartTime = millis();
+        }
+        return;
     }
-    
-    // Safety timeout check (with 2 second margin)
-    if (elapsedTime > StateDuration + 2000) {
-        StateFlags.DISPENSE_TimeoutOccurred = true;
+
+    if (millis() - StateStartTime > StateDuration) {
+        StopDispenseWithError("[DISPENSE] TIMEOUT - Stopping dispense");
+        return;
+    }
+
+    if (CurrentDispensePhase == DISPENSE_FILL_SHOWERHEAD) {
+        unsigned long fillPulseCount = FlowPulseCount - FillStartPulseCount;
+        float fillVolumeML = (float)fillPulseCount / FLOW_SENSOR_CALIBRATION;
+        CurrentFlowRate = CalculateFlowRate();
+
+        if (fillVolumeML >= CurrentFillTargetML) {
+            // Stop adding water at the showerhead capacity; leave the valve open to drain.
+            digitalWrite(PUMP_2_PIN, LOW);
+            CurrentPourDispensedML += CurrentFillTargetML;
+            CurrentDispensePhase = DISPENSE_DRAIN_SHOWERHEAD;
+            DispensePhaseStartTime = millis();
+
+            Serial.print("[DISPENSE] Fill complete: ");
+            Serial.print(CurrentFillTargetML);
+            Serial.println(" mL. Draining showerhead...");
+            return;
+        }
+
+        if (millis() - DispensePhaseStartTime > FLOW_START_TIMEOUT_MS &&
+            FlowPulseCount == FillStartPulseCount) {
+            StopDispenseWithError("[DISPENSE] ERROR: No flow detected while filling showerhead");
+            return;
+        }
+
+        if (millis() - DispensePhaseStartTime > FILL_FLOW_TIMEOUT_MS) {
+            StopDispenseWithError("[DISPENSE] ERROR: Showerhead fill timed out");
+            return;
+        }
+        return;
+    }
+
+    if (CurrentDispensePhase == DISPENSE_DRAIN_SHOWERHEAD) {
+        if (millis() - DispensePhaseStartTime < SHOWERHEAD_DRAIN_TIME_MS) {
+            return;
+        }
+
+        digitalWrite(SOLENOID_PIN, LOW);
+        if (CurrentPourDispensedML + 0.01 < CurrentPourTargetML) {
+            StartShowerheadFill(CurrentPourTargetML - CurrentPourDispensedML);
+            return;
+        }
+
+        if (CurrentPour == 0) {
+            CurrentDispensePhase = DISPENSE_BLOOM_SOAK;
+            DispensePhaseStartTime = millis();
+            Serial.println("[DISPENSE] Bloom complete. Starting bloom soak...");
+            return;
+        }
+
+        if (CurrentPour >= 4) {
+            CurrentDispensePhase = DISPENSE_COMPLETE;
+        } else {
+            CurrentDispensePhase = DISPENSE_PAUSE_BETWEEN_POURS;
+            DispensePhaseStartTime = millis();
+            Serial.println("[DISPENSE] Pour complete. Starting 30 second rest...");
+        }
+    }
+
+    if (CurrentDispensePhase == DISPENSE_BLOOM_SOAK) {
+        if (millis() - DispensePhaseStartTime < BLOOM_SOAK_TIME_MS) {
+            return;
+        }
+
+        if (PourTargetML <= 0.0) {
+            CurrentDispensePhase = DISPENSE_COMPLETE;
+            return;
+        }
+
+        CurrentPour = 1;
+        CurrentPourTargetML = PourTargetML;
+        CurrentPourDispensedML = 0.0;
+        StartShowerheadFill(CurrentPourTargetML);
+        Serial.println("[DISPENSE] Starting regular pour 1 of 4");
+        return;
+    }
+
+    if (CurrentDispensePhase == DISPENSE_PAUSE_BETWEEN_POURS) {
+        if (millis() - DispensePhaseStartTime < PAUSE_BETWEEN_POURS_MS) {
+            return;
+        }
+
+        CurrentPour++;
+        CurrentPourTargetML = PourTargetML;
+        CurrentPourDispensedML = 0.0;
+        StartShowerheadFill(CurrentPourTargetML);
+        Serial.print("[DISPENSE] Starting regular pour ");
+        Serial.print(CurrentPour);
+        Serial.println(" of 4");
+        return;
+    }
+
+    if (CurrentDispensePhase == DISPENSE_COMPLETE) {
         digitalWrite(PUMP_2_PIN, LOW);
         digitalWrite(SOLENOID_PIN, LOW);
         detachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN_2));
-        
-        Serial.println("[DISPENSE] TIMEOUT - Stopping dispense");
-        CurrentState = ERROR;
+
+        StateFlags.DISPENSE_DispensingComplete = true;
+        StateFlags.GENERAL_Initialized = false;
+        CurrentState = IDLE;
         StateStartTime = millis();
-        memset(&StateFlags, 0, sizeof(StateFlags));
-        FlowPulseCount = 0;
-        return;
+
+        Serial.println("[DISPENSE] ========== DISPENSE COMPLETE ==========");
+        Serial.print("[DISPENSE] Target water dispensed: ");
+        Serial.print(TotalDispenseTargetML);
+        Serial.println(" mL");
     }
 }
 void HandleERROR(){ //NOT CORRECT CURRENTLY
@@ -883,9 +941,11 @@ void setup() {
    digitalWrite(SOLENOID_PIN, HIGH); // Turn solenoid ON (open valve)
         delay(500);
         digitalWrite(PUMP_2_PIN, HIGH);   // Turn PUMP_2 ON
-    
-}
 
+        delay(1000);
+        digitalWrite(PUMP_2_PIN, LOW);   // Turn PUMP_2 OFF
+}
+//Retry
 void loop(){  
 
 
